@@ -1,78 +1,47 @@
-import { getConfigAddresses, extractWireguardParams, generateRemark, randomUpperCase, getRandomPath, isIPv6 } from './helpers';
-import { initializeParams, userID, trojanPassword, hostName, defaultHttpsPorts } from "../helpers/init";
-import { renderErrorPage } from '../pages/error';
+import { getConfigAddresses, extractWireguardParams, generateRemark, randomUpperCase, getRandomPath, isIPv6, isDomain, base64ToDecimal, getDomain } from './helpers';
 import { getDataset } from '../kv/handlers';
-import { isDomain } from '../helpers/helpers';
 
-function buildSingBoxDNS (proxySettings, outboundAddrs, isWarp, remoteDNSDetour) {
-    const { 
-        remoteDNS, 
-        localDNS, 
-        vlessTrojanFakeDNS, 
-        enableIPv6,
-        warpFakeDNS,
-        warpEnableIPv6,
-        bypassIran, 
-        bypassChina, 
-        bypassRussia, 
-        blockAds, 
-        blockPorn,
-        customBypassRules,
-        customBlockRules
-    } = proxySettings;
+async function buildSingBoxDNS(isWarp) {
+    const settings = globalThis.settings;
+    const url = new URL(settings.remoteDNS);
+    const dnsProtocol = url.protocol.replace(':', '');
 
-    let fakeip;
-    const isFakeDNS = (vlessTrojanFakeDNS && !isWarp) || (warpFakeDNS && isWarp);
-    const isIPv6 = (enableIPv6 && !isWarp) || (warpEnableIPv6 && isWarp);
-    const customBypassRulesDomains = customBypassRules.split(',').filter(address => isDomain(address));
-    const customBlockRulesDomains = customBlockRules.split(',').filter(address => isDomain(address));
-    const geoRules = [
-        { rule: bypassIran, type: 'direct', geosite: "geosite-ir", geoip: "geoip-ir" },
-        { rule: bypassChina, type: 'direct', geosite: "geosite-cn", geoip: "geoip-cn" },
-        { rule: bypassRussia, type: 'direct', geosite: "geosite-category-ru", geoip: "geoip-ru" },
-        { rule: true, type: 'block', geosite: "geosite-malware" },
-        { rule: true, type: 'block', geosite: "geosite-phishing" },
-        { rule: true, type: 'block', geosite: "geosite-cryptominers" },
-        { rule: blockAds, type: 'block', geosite: "geosite-category-ads-all" },
-        { rule: blockPorn, type: 'block', geosite: "geosite-nsfw" }
-    ];
     const servers = [
         {
-            address: isWarp ? "1.1.1.1" : remoteDNS,
-            address_resolver: "dns-direct",
-            strategy: isIPv6 ? "prefer_ipv4" : "ipv4_only",
-            detour: remoteDNSDetour,
+            type: isWarp ? "udp" : dnsProtocol,
+            server: isWarp ? "1.1.1.1" : settings.dohHost.host,
+            detour: "✅ Selector",
             tag: "dns-remote"
         },
-        {
-            address: localDNS,
-            strategy: isIPv6 ? "prefer_ipv4" : "ipv4_only",
-            detour: "direct",
-            tag: "dns-direct"
-        },
-        {
-            address: "rcode://success",
-            tag: "dns-block"
-        }
     ];
 
-    let outboundRule;
-    if (isWarp) {
-        outboundRule = { 
-            outbound: "any", 
-            server: "dns-direct" 
-        };
+    function addDnsServer(type, server, server_port, detour, tag, domain_resolver) {
+        servers.push({
+            type,
+            ...(server && { server }),
+            ...(server_port && { server_port }),
+            ...(detour && { detour }),
+            ...(domain_resolver && {
+                domain_resolver: {
+                    server: domain_resolver,
+                    strategy: "ipv4_only"
+                }
+            }),
+            tag
+        });
+    }
+
+    if (settings.localDNS === 'localhost') {
+        addDnsServer("local", null, null, null, "dns-direct");
     } else {
-        const outboundDomains = outboundAddrs.filter(address => isDomain(address));
-        const uniqueDomains = [...new Set(outboundDomains)];
-        outboundRule = { 
-            domain: uniqueDomains, 
-            server: "dns-direct" 
-        };
+        addDnsServer("udp", settings.localDNS, 53, null, "dns-direct");
     }
 
     const rules = [
-        outboundRule,
+        {
+            domain: ["raw.githubusercontent.com"],
+            server: "dns-direct"
+        },
         {
             clash_mode: "Direct",
             server: "dns-direct"
@@ -82,108 +51,122 @@ function buildSingBoxDNS (proxySettings, outboundAddrs, isWarp, remoteDNSDetour)
             server: "dns-remote"
         }
     ];
-    
-    let blockRule = {
-        disable_cache: true,
-        rule_set: [],
-        server: "dns-block"
-    };
 
-    geoRules.forEach(({ rule, type, geosite, geoip }) => {
-        rule && type === 'direct' && rules.push({
-            type: "logical",
-            mode: "and",
-            rules: [
-                { rule_set: geosite },
-                { rule_set: geoip }
-            ],
-            "server": "dns-direct"
+    if (settings.dohHost.isDomain && !isWarp) {
+        const { ipv4, ipv6, host } = settings.dohHost;
+        const answers = [
+            ...ipv4.map(ip => `${host}. IN A ${ip}`),
+            ...(settings.VLTRenableIPv6 ? ipv6.map(ip => `${host}. IN AAAA ${ip}`) : [])
+        ];
+
+        rules.unshift({
+            domain: host,
+            action: "predefined",
+            answer: answers
         });
-
-        rule && type === 'block' && blockRule.rule_set.push(geosite);
-    });
-
-    rules.push(blockRule);
-    const createRule = (server) => ({ 
-        domain_suffix: [], 
-        server 
-    });
-
-    let domainDirectRule, domainBlockRule;
-    if (customBypassRulesDomains.length) {
-        domainDirectRule = createRule("dns-direct");
-        customBypassRulesDomains.forEach( domain => {
-            domainDirectRule.domain_suffix.push(domain);
-        });
-        
-        rules.push(domainDirectRule);
-    }
-    
-    if (customBlockRulesDomains.length) {
-        domainBlockRule = createRule("dns-block");
-        customBlockRulesDomains.forEach( domain => {
-            domainBlockRule.domain_suffix.push(domain);
-        });
-
-        rules.push(domainBlockRule);
     }
 
+    function addDnsRule(geosite, geoip, domain, dns) {
+        let type, mode;
+        const ruleSets = [];
+        if (geoip) {
+            mode = 'and';
+            type = 'logical';
+            ruleSets.push({ rule_set: geosite }, { rule_set: geoip });
+        }
+        const action = dns === 'reject' ? 'reject' : 'route';
+        const server = dns === 'reject' ? null : dns;
+
+        rules.push({
+            ...(type && { type }),
+            ...(mode && { mode }),
+            ...(ruleSets.length && { rules: ruleSets }),
+            ...(geosite && !geoip && { rule_set: geosite }),
+            ...(domain && { domain_suffix: domain }),
+            action,
+            ...(server && { server })
+        });
+    }
+
+    const routingRules = getRoutingRules();
+
+    settings.customBlockRules.filter(isDomain).forEach(domain => {
+        routingRules.unshift({ rule: true, domain: domain, type: 'reject' });
+    });
+
+    settings.customBypassRules.filter(isDomain).forEach(domain => {
+        routingRules.push({ rule: true, domain: domain, type: 'direct', dns: "dns-direct" });
+    });
+
+    settings.customBypassSanctionRules.filter(isDomain).forEach(domain => {
+        routingRules.push({ rule: true, domain: domain, type: 'direct', dns: "dns-anti-sanction" });
+    });
+
+    const groupedRules = new Map();
+    routingRules.filter(({ rule }) => rule).forEach(({ geosite, geoip, domain, type, dns }) => {
+        if (geosite && geoip && type === 'direct') {
+            addDnsRule(geosite, geoip, null, dns);
+        } else {
+            const dnsType = dns || type;
+            if (!groupedRules.has(dnsType)) groupedRules.set(dnsType, { geosite: [], domain: [] });
+            if (geosite) groupedRules.get(dnsType).geosite.push(geosite);
+            if (domain) groupedRules.get(dnsType).domain.push(domain);
+        }
+    });
+
+    for (const [dnsType, rule] of groupedRules) {
+        const { geosite, domain } = rule;
+        if (domain.length) addDnsRule(null, null, domain, dnsType);
+        if (geosite.length) addDnsRule(geosite, null, null, dnsType);
+    }
+
+    const isSanctionRule = groupedRules.has("dns-anti-sanction");
+    if (isSanctionRule) {
+        const dnsHost = getDomain(settings.antiSanctionDNS);
+        if (dnsHost.isHostDomain) {
+            addDnsServer("https", dnsHost.host, 443, null, "dns-anti-sanction", "dns-direct");
+        } else {
+            addDnsServer("udp", settings.antiSanctionDNS, 53, null, "dns-anti-sanction", null);
+        }
+    }
+
+    const isFakeDNS = (settings.VLTRFakeDNS && !isWarp) || (settings.warpFakeDNS && isWarp);
     if (isFakeDNS) {
-        servers.push({
-            address: "fakeip",
-            tag: "dns-fake"
-        });
+        const fakeip = {
+            type: "fakeip",
+            tag: "dns-fake",
+            inet4_range: "198.18.0.0/15"
+        };
+
+        const isIPv6 = (settings.VLTRenableIPv6 && !isWarp) || (settings.warpEnableIPv6 && isWarp);
+        if (isIPv6) fakeip.inet6_range = "fc00::/18";
+        servers.push(fakeip);
 
         rules.push({
             disable_cache: true,
             inbound: "tun-in",
             query_type: [
-              "A",
-              "AAAA"
+                "A",
+                "AAAA"
             ],
             server: "dns-fake"
         });
-
-        fakeip = {
-            enabled: true,
-            inet4_range: "198.18.0.0/15"
-        };
-
-        if (isIPv6) fakeip.inet6_range = "fc00::/18";
     }
 
-    return {servers, rules, fakeip};
+    return {
+        servers,
+        rules,
+        strategy: "ipv4_only",
+        independent_cache: true
+    }
 }
 
-function buildSingBoxRoutingRules (proxySettings) {
-    const { 
-        bypassLAN, 
-        bypassIran, 
-        bypassChina, 
-        bypassRussia, 
-        blockAds, 
-        blockPorn, 
-        blockUDP443,
-        customBypassRules,
-        customBlockRules 
-    } = proxySettings;
-
-    const customBypassRulesTotal = customBypassRules ? customBypassRules.split(',') : [];
-    const customBlockRulesTotal = customBlockRules ? customBlockRules.split(',') : [];
-    const defaultRules = [
+function buildSingBoxRoutingRules(isWarp) {
+    const settings = globalThis.settings;
+    const rules = [
         {
-            type: "logical",
-            mode: "or",
-            rules: [
-                {
-                    inbound: "dns-in",
-                },
-                {
-                    network: "udp",
-                    port: 53
-                }
-            ],
-            outbound: "dns-out"
+            ip_cidr: "172.18.0.2",
+            action: "hijack-dns"
         },
         {
             clash_mode: "Direct",
@@ -192,185 +175,124 @@ function buildSingBoxRoutingRules (proxySettings) {
         {
             clash_mode: "Global",
             outbound: "✅ Selector"
+        },
+        {
+            action: "sniff"
+        },
+        {
+            protocol: "dns",
+            action: "hijack-dns"
         }
     ];
 
-    const geoRules = [
-        { 
-            rule: bypassIran,
-            type: 'direct',
-            ruleSet: { 
-                geosite: "geosite-ir", 
-                geoip: "geoip-ir", 
-                geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-ir.srs", 
-                geoipURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-ir.srs"
-            }
-        },
-        { 
-            rule: bypassChina,
-            type: 'direct',
-            ruleSet: { 
-                geosite: "geosite-cn", 
-                geoip: "geoip-cn", 
-                geositeURL: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs", 
-                geoipURL: "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
-            }
-        },
-        { 
-            rule: bypassRussia,
-            type: 'direct', 
-            ruleSet: { 
-                geosite: "geosite-category-ru",
-                geoip: "geoip-ru", 
-                geositeURL: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs", 
-                geoipURL: "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs"
-            }
-        },
-        { 
-            rule: true,
-            type: 'block', 
-            ruleSet: { 
-                geosite: "geosite-malware", 
-                geoip: "geoip-malware", 
-                geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-malware.srs", 
-                geoipURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-malware.srs"
-            }
-        },
-        { 
-            rule: true,
-            type: 'block',
-            ruleSet: { 
-                geosite: "geosite-phishing", 
-                geoip: "geoip-phishing", 
-                geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-phishing.srs", 
-                geoipURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-phishing.srs"
-            }
-        },
-        { 
-            rule: true,
-            type: 'block',
-            ruleSet: { 
-                geosite: "geosite-cryptominers", 
-                geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-cryptominers.srs", 
-            }
-        },
-        { 
-            rule: blockAds,
-            type: 'block',
-            ruleSet: { 
-                geosite: "geosite-category-ads-all", 
-                geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-category-ads-all.srs", 
-            }
-        },
-        { 
-            rule: blockPorn,
-            type: 'block', 
-            ruleSet: { 
-                geosite: "geosite-nsfw", 
-                geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-nsfw.srs", 
-            }
-        },
-    ];
-
-    const directDomainRules = [], directIPRules = [], blockDomainRules = [], blockIPRules = [], ruleSets = [];
-    bypassLAN && directIPRules.push({
+    if (settings.bypassLAN) rules.push({
         ip_is_private: true,
         outbound: "direct"
     });
 
-    const createRule = (rule, outbound) => ({
-        [rule]: [],
-        outbound
+    function addRoutingRule(domain, ip, geosite, geoip, network, protocol, port, type) {
+        const action = type === 'reject' ? 'reject' : 'route';
+        const outbound = type === 'direct' ? 'direct' : null;
+        rules.push({
+            ...(geosite && { rule_set: geosite }),
+            ...(geoip && { rule_set: geoip }),
+            ...(domain && { domain_suffix: domain }),
+            ...(ip && { ip_cidr: ip }),
+            ...(network && { network }),
+            ...(protocol && { protocol }),
+            ...(port && { port }),
+            action,
+            ...(outbound && { outbound })
+        });
+    }
+
+    if (isWarp && settings.blockUDP443) addRoutingRule(null, null, null, null, "udp", "quic", 443, 'reject');
+    if (!isWarp) addRoutingRule(null, null, null, null, "udp", null, null, 'reject');
+
+    const routingRules = getRoutingRules();
+    settings.customBlockRules.forEach(value => {
+        const isDomainValue = isDomain(value);
+        routingRules.push({
+            rule: true,
+            type: 'reject',
+            domain: isDomainValue ? value : null,
+            ip: isDomainValue ? null : isIPv6(value) ? value.replace(/\[|\]/g, '') : value
+        });
     });
 
-    const routingRuleSet = {
-        type: "remote",
-        tag: "",
-        format: "binary",
-        url: "",
-        download_detour: "direct"
-    };
-
-    const directDomainRule = createRule('rule_set', 'direct');;
-    const directIPRule = createRule('rule_set', 'direct');;
-    const blockDomainRule = createRule('rule_set', 'block');
-    const blockIPRule = createRule('rule_set', 'block');
-
-    geoRules.forEach(({ rule, type, ruleSet }) => {
-        if (!rule) return;
-        const { geosite, geoip, geositeURL, geoipURL } = ruleSet;
-        const isDirect = type === 'direct';
-        const domainRule = isDirect ? directDomainRule : blockDomainRule;
-        const ipRule = isDirect ? directIPRule : blockIPRule;
-        
-        domainRule.rule_set.push(geosite);
-        ruleSets.push({ ...routingRuleSet, tag: geosite, url: geositeURL });
-        if (geoip) {
-            ipRule.rule_set.push(geoip);
-            ruleSets.push({ ...routingRuleSet, tag: geoip, url: geoipURL });
-        } 
+    const bypassRules = [...settings.customBypassRules, ...settings.customBypassSanctionRules];
+    bypassRules.forEach(value => {
+        const isDomainValue = isDomain(value);
+        routingRules.push({
+            rule: true,
+            type: 'direct',
+            domain: isDomainValue ? value : null,
+            ip: isDomainValue ? null : isIPv6(value) ? value.replace(/\[|\]/g, '') : value
+        });
     });
 
-    const pushRuleIfNotEmpty = (rule, targetArray) => {
-        if (rule.rule_set?.length || rule.domain_suffix?.length || rule.ip_cidr?.length) {
-            targetArray.push(rule);
-        }
-    };
-    
-    pushRuleIfNotEmpty(directDomainRule, directDomainRules);
-    pushRuleIfNotEmpty(directIPRule, directIPRules);
-    pushRuleIfNotEmpty(blockDomainRule, blockDomainRules);
-    pushRuleIfNotEmpty(blockIPRule, blockIPRules);
-
-    const processRules = (addresses, action) => {
-        const domainRule = createRule('domain_suffix', action);
-        const ipRule = createRule('ip_cidr', action); 
-        addresses.forEach(address => {
-            if (isDomain(address)) {
-                domainRule.domain_suffix.push(address);
-            } else {
-                const ip = isIPv6(address) ? address.replace(/\[|\]/g, '') : address;
-                ipRule.ip_cidr.push(ip);
-            }
+    const ruleSets = [];
+    const addRuleSet = (geoRule) => {
+        const { geosite, geositeURL, geoip, geoipURL } = geoRule;
+        if (geosite) ruleSets.push({
+            type: "remote",
+            tag: geosite,
+            format: "binary",
+            url: geositeURL,
+            download_detour: "direct"
         });
 
-        pushRuleIfNotEmpty(domainRule, action === 'direct' ? directDomainRules : blockDomainRules);
-        pushRuleIfNotEmpty(ipRule, action === 'direct' ? directIPRules : blockIPRules);
-    };
-    
-    customBypassRulesTotal.length && processRules(customBypassRulesTotal, 'direct');    
-    customBlockRulesTotal.length && processRules(customBlockRulesTotal, 'block');
-    const rules = [...defaultRules, ...directDomainRules, ...directIPRules, ...blockDomainRules, ...blockIPRules];
-    blockUDP443 && rules.push({
-        network: "udp",
-        port: 443,
-        protocol: "quic",
-        outbound: "block"
+        if (geoip) ruleSets.push({
+            type: "remote",
+            tag: geoip,
+            format: "binary",
+            url: geoipURL,
+            download_detour: "direct"
+        });
+    }
+
+    const groupedRules = new Map();
+    routingRules.filter(({ rule }) => rule).forEach(routingRule => {
+        const { type, domain, ip, geosite, geoip } = routingRule;
+        if (!groupedRules.has(type)) groupedRules.set(type, { domain: [], ip: [], geosite: [], geoip: [] });
+        if (domain) groupedRules.get(type).domain.push(domain);
+        if (ip) groupedRules.get(type).ip.push(ip);
+        if (geosite) groupedRules.get(type).geosite.push(geosite);
+        if (geoip) groupedRules.get(type).geoip.push(geoip);
+        if (geosite || geoip) addRuleSet(routingRule);
     });
 
-    return {rules, rule_set: ruleSets};
+    for (const [type, rule] of groupedRules) {
+        const { domain, ip, geosite, geoip } = rule;
+
+        if (domain.length) addRoutingRule(domain, null, null, null, null, null, null, type);
+        if (geosite.length) addRoutingRule(null, null, geosite, null, null, null, null, type);
+        if (ip.length) addRoutingRule(null, ip, null, null, null, null, null, type);
+        if (geoip.length) addRoutingRule(null, null, null, geoip, null, null, null, type);
+    }
+
+    return {
+        rules,
+        rule_set: ruleSets,
+        auto_detect_interface: true,
+        // override_android_vpn: true,
+        final: "✅ Selector"
+    }
 }
 
-function buildSingBoxVLESSOutbound (proxySettings, remark, address, port, host, sni, allowInsecure, isFragment) {
-    const { enableIPv6, lengthMin, lengthMax, intervalMin, intervalMax, proxyIP } = proxySettings;
-    const path = `/${getRandomPath(16)}${proxyIP ? `/${btoa(proxyIP)}` : ''}`;
-    const tls = defaultHttpsPorts.includes(port) ? true : false;
-    const outbound =  {
+function buildSingBoxVLOutbound(remark, address, port, host, sni, allowInsecure, isFragment) {
+    const settings = globalThis.settings;
+    const path = `/${getRandomPath(16)}${settings.proxyIPs.length ? `/${btoa(settings.proxyIPs.join(','))}` : ''}`;
+    const tls = globalThis.defaultHttpsPorts.includes(port) ? true : false;
+
+    const outbound = {
+        tag: remark,
         type: "vless",
         server: address,
-        server_port: +port,
-        domain_strategy: enableIPv6 ? "prefer_ipv4" : "ipv4_only",
-        uuid: userID,
-        tls: {
-            alpn: "http/1.1",
-            enabled: true,
-            insecure: allowInsecure,
-            server_name: sni,
-            utls: {
-                enabled: true,
-                fingerprint: "randomized"
-            }
-        },
+        server_port: port,
+        uuid: globalThis.userID,
+        network: "tcp",
+        packet_encoding: "",
         transport: {
             early_data_header_name: "Sec-WebSocket-Protocol",
             max_early_data: 2560,
@@ -380,39 +302,42 @@ function buildSingBoxVLESSOutbound (proxySettings, remark, address, port, host, 
             path: path,
             type: "ws"
         },
-        tag: remark
+        domain_resolver: {
+            server: "dns-direct",
+            strategy: settings.VLTRenableIPv6 ? "prefer_ipv4" : "ipv4_only",
+            rewrite_ttl: 60
+        },
+        tcp_fast_open: true,
+        tcp_multi_path: true
     };
 
-    if (!tls) delete outbound.tls;
-    if (isFragment) outbound.tls_fragment = {
+    if (tls) outbound.tls = {
+        alpn: "http/1.1",
         enabled: true,
-        size: `${lengthMin}-${lengthMax}`,
-        sleep: `${intervalMin}-${intervalMax}`
+        insecure: allowInsecure,
+        server_name: sni,
+        record_fragment: isFragment,
+        utls: {
+            enabled: true,
+            fingerprint: "randomized"
+        }
     };
 
     return outbound;
 }
 
-function buildSingBoxTrojanOutbound (proxySettings, remark, address, port, host, sni, allowInsecure, isFragment) {
-    const { enableIPv6, lengthMin, lengthMax, intervalMin, intervalMax, proxyIP } = proxySettings;
-    const path = `/tr${getRandomPath(16)}${proxyIP ? `/${btoa(proxyIP)}` : ''}`;
-    const tls = defaultHttpsPorts.includes(port) ? true : false;
+function buildSingBoxTROutbound(remark, address, port, host, sni, allowInsecure, isFragment) {
+    const settings = globalThis.settings;
+    const path = `/tr${getRandomPath(16)}${settings.proxyIPs.length ? `/${btoa(settings.proxyIPs.join(','))}` : ''}`;
+    const tls = globalThis.defaultHttpsPorts.includes(port) ? true : false;
+
     const outbound = {
+        tag: remark,
         type: "trojan",
-        password: trojanPassword,
+        password: globalThis.TRPassword,
         server: address,
-        server_port: +port,
-        domain_strategy: enableIPv6 ? "prefer_ipv4" : "ipv4_only",
-        tls: {
-            alpn: "http/1.1",
-            enabled: true,
-            insecure: allowInsecure,
-            server_name: sni,
-            utls: {
-                enabled: true,
-                fingerprint: "randomized"
-            }
-        },
+        server_port: port,
+        network: "tcp",
         transport: {
             early_data_header_name: "Sec-WebSocket-Protocol",
             max_early_data: 2560,
@@ -422,34 +347,38 @@ function buildSingBoxTrojanOutbound (proxySettings, remark, address, port, host,
             path: path,
             type: "ws"
         },
-        tag: remark
+        domain_resolver: {
+            server: "dns-direct",
+            strategy: settings.VLTRenableIPv6 ? "prefer_ipv4" : "ipv4_only",
+            rewrite_ttl: 60
+        },
+        tcp_fast_open: true,
+        tcp_multi_path: true
     }
 
-    if (!tls) delete outbound.tls;
-    if (isFragment) outbound.tls_fragment = {
+    if (tls) outbound.tls = {
+        alpn: "http/1.1",
         enabled: true,
-        size: `${lengthMin}-${lengthMax}`,
-        sleep: `${intervalMin}-${intervalMax}`
+        insecure: allowInsecure,
+        server_name: sni,
+        record_fragment: isFragment,
+        utls: {
+            enabled: true,
+            fingerprint: "randomized"
+        }
     };
 
-    return outbound;    
+    return outbound;
 }
 
-function buildSingBoxWarpOutbound (proxySettings, warpConfigs, remark, endpoint, chain, client) {
+function buildSingBoxWarpOutbound(warpConfigs, remark, endpoint, chain) {
+    const settings = globalThis.settings;
     const ipv6Regex = /\[(.*?)\]/;
     const portRegex = /[^:]*$/;
     const endpointServer = endpoint.includes('[') ? endpoint.match(ipv6Regex)[1] : endpoint.split(':')[0];
     const endpointPort = endpoint.includes('[') ? +endpoint.match(portRegex)[0] : +endpoint.split(':')[1];
-    const { 
-        warpEnableIPv6,
-		hiddifyNoiseMode, 
-		noiseCountMin, 
-		noiseCountMax, 
-		noiseSizeMin, 
-		noiseSizeMax, 
-		noiseDelayMin, 
-		noiseDelayMax 
-	} = proxySettings;
+    const server = chain ? "162.159.192.1" : endpointServer;
+    const port = chain ? 2408 : endpointPort;
 
     const {
         warpIPv6,
@@ -459,36 +388,43 @@ function buildSingBoxWarpOutbound (proxySettings, warpConfigs, remark, endpoint,
     } = extractWireguardParams(warpConfigs, chain);
 
     const outbound = {
-        local_address: [
+        tag: remark,
+        type: "wireguard",
+        address: [
             "172.16.0.2/32",
             warpIPv6
         ],
         mtu: 1280,
-        peer_public_key: publicKey,
+        peers: [
+            {
+                address: server,
+                port: port,
+                public_key: publicKey,
+                reserved: base64ToDecimal(reserved),
+                allowed_ips: [
+                    "0.0.0.0/0",
+                    "::/0"
+                ],
+                persistent_keepalive_interval: 5
+            }
+        ],
         private_key: privateKey,
-        reserved: reserved,
-        server: endpointServer,
-        server_port: endpointPort,
-        domain_strategy: warpEnableIPv6 ? "prefer_ipv4" : "ipv4_only",
-        type: "wireguard",
-        detour: chain,
-        tag: remark
+        domain_resolver: {
+            server: chain ? "dns-remote" : "dns-direct",
+            strategy: settings.warpEnableIPv6 ? "prefer_ipv4" : "ipv4_only",
+            rewrite_ttl: 60
+        }
     };
 
-    client === 'hiddify' && Object.assign(outbound, {
-        fake_packets_mode: hiddifyNoiseMode,
-        fake_packets: noiseCountMin === noiseCountMax ? noiseCountMin : `${noiseCountMin}-${noiseCountMax}`,
-        fake_packets_size: noiseSizeMin === noiseSizeMax ? noiseSizeMin : `${noiseSizeMin}-${noiseSizeMax}`,
-        fake_packets_delay: noiseDelayMin === noiseDelayMax ? noiseDelayMin : `${noiseDelayMin}-${noiseDelayMax}`
-    });
-
+    if (chain) outbound.detour = chain;
     return outbound;
 }
 
-function buildSingBoxChainOutbound (chainProxyParams, enableIPv6) {
+function buildSingBoxChainOutbound(chainProxyParams) {
+    const settings = globalThis.settings;
     if (["socks", "http"].includes(chainProxyParams.protocol)) {
         const { protocol, server, port, user, pass } = chainProxyParams;
-    
+
         const chainOutbound = {
             type: protocol,
             tag: "",
@@ -496,9 +432,14 @@ function buildSingBoxChainOutbound (chainProxyParams, enableIPv6) {
             server_port: +port,
             username: user,
             password: pass,
+            domain_resolver: {
+                server: "dns-remote",
+                strategy: settings.VLTRenableIPv6 ? "prefer_ipv4" : "ipv4_only",
+                rewrite_ttl: 60
+            },
             detour: ""
         };
-    
+
         if (protocol === 'socks') chainOutbound.version = "5";
         return chainOutbound;
     }
@@ -509,9 +450,13 @@ function buildSingBoxChainOutbound (chainProxyParams, enableIPv6) {
         tag: "",
         server: server,
         server_port: +port,
-        domain_strategy: enableIPv6 ? "prefer_ipv4" : "ipv4_only",
         uuid: uuid,
         flow: flow,
+        domain_resolver: {
+            server: "dns-remote",
+            strategy: settings.VLTRenableIPv6 ? "prefer_ipv4" : "ipv4_only",
+            rewrite_ttl: 60
+        },
         detour: ""
     };
 
@@ -546,7 +491,7 @@ function buildSingBoxChainOutbound (chainProxyParams, enableIPv6) {
             host: httpHosts,
             path: path,
             method: "GET",
-            headers: { 
+            headers: {
                 "Connection": ["keep-alive"],
                 "Content-Type": ["application/octet-stream"]
             },
@@ -573,44 +518,63 @@ function buildSingBoxChainOutbound (chainProxyParams, enableIPv6) {
     return chainOutbound;
 }
 
-export async function getSingBoxWarpConfig (request, env, client) {
-    const { kvNotFound, proxySettings, warpConfigs } = await getDataset(request, env);
-    if (kvNotFound) return await renderErrorPage(request, env, 'KV Dataset is not properly set!', null, true);
-    const { warpEndpoints } = proxySettings;
+async function buildSingBoxConfig(selectorTags, urlTestTags, secondUrlTestTags, isWarp, isIPv6) {
+    const settings = globalThis.settings;
     const config = structuredClone(singboxConfigTemp);
-    const proIndicator = client === 'hiddify' ? ' Pro ' : ' ';
-    const dnsObject = buildSingBoxDNS(proxySettings, undefined, true, `💦 Warp${proIndicator}- Best Ping 🚀`);
-    const {rules, rule_set} = buildSingBoxRoutingRules(proxySettings);
-    config.dns.servers = dnsObject.servers;
-    config.dns.rules = dnsObject.rules;
-    if (dnsObject.fakeip) config.dns.fakeip = dnsObject.fakeip;
-    config.route.rules = rules;
-    config.route.rule_set = rule_set;
-    const selector = config.outbounds[0];
-    const warpUrlTest = config.outbounds[1];
-    selector.outbounds = [`💦 Warp${proIndicator}- Best Ping 🚀`, `💦 WoW${proIndicator}- Best Ping 🚀`];
-    config.outbounds.splice(2, 0, structuredClone(warpUrlTest));
-    const WoWUrlTest = config.outbounds[2];
-    warpUrlTest.tag = `💦 Warp${proIndicator}- Best Ping 🚀`;
-    warpUrlTest.interval = `${proxySettings.bestWarpInterval}s`;
-    WoWUrlTest.tag = `💦 WoW${proIndicator}- Best Ping 🚀`;
-    WoWUrlTest.interval = `${proxySettings.bestWarpInterval}s`;
-    const warpRemarks = [], WoWRemarks = [];
+    config.dns = await buildSingBoxDNS(isWarp);
+    config.route = buildSingBoxRoutingRules(isWarp);
 
-    warpEndpoints.split(',').forEach( (endpoint, index) => {
-        const warpRemark = `💦 ${index + 1} - Warp 🇮🇷`;
-        const WoWRemark = `💦 ${index + 1} - WoW 🌍`;
-        const warpOutbound = buildSingBoxWarpOutbound(proxySettings, warpConfigs, warpRemark, endpoint, '', client);
-        const WoWOutbound = buildSingBoxWarpOutbound(proxySettings, warpConfigs, WoWRemark, endpoint, warpRemark, client);
-        config.outbounds.push(WoWOutbound, warpOutbound);
-        warpRemarks.push(warpRemark);
-        WoWRemarks.push(WoWRemark);
-        warpUrlTest.outbounds.push(warpRemark);
-        WoWUrlTest.outbounds.push(WoWRemark);
+    if (isIPv6) config.inbounds.find(({ type }) => type === 'tun').address.push("fdfe:dcba:9876::1/126");
+    config.outbounds.find(({ type }) => type === 'selector').outbounds = selectorTags;
+
+    const urlTest = {
+        type: "urltest",
+        tag: isWarp ? `💦 Warp - Best Ping 🚀` : '💦 Best Ping 💥',
+        outbounds: urlTestTags,
+        url: "https://www.gstatic.com/generate_204",
+        interval: isWarp ? `${settings.bestWarpInterval}s` : `${settings.bestVLTRInterval}s`
+    };
+
+    config.outbounds.push(urlTest);
+
+    if (isWarp) {
+        const secondUrlTest = structuredClone(urlTest);
+        secondUrlTest.tag = `💦 WoW - Best Ping 🚀`;
+        secondUrlTest.outbounds = secondUrlTestTags;
+        config.outbounds.push(secondUrlTest);
+    }
+
+    return config;
+}
+
+export async function getSingBoxWarpConfig(request, env) {
+    const settings = globalThis.settings;
+    const { warpConfigs } = await getDataset(request, env);
+    const warpTags = [], wowTags = [];
+    const endpoints = {
+        proxies: [],
+        chains: []
+    }
+
+    settings.warpEndpoints.forEach((endpoint, index) => {
+        const warpTag = `💦 ${index + 1} - Warp 🇮🇷`;
+        warpTags.push(warpTag);
+
+        const wowTag = `💦 ${index + 1} - WoW 🌍`;
+        wowTags.push(wowTag);
+
+        const warpOutbound = buildSingBoxWarpOutbound(warpConfigs, warpTag, endpoint, '');
+        endpoints.proxies.push(warpOutbound);
+
+        const wowOutbound = buildSingBoxWarpOutbound(warpConfigs, wowTag, endpoint, warpTag);
+        endpoints.chains.push(wowOutbound);
     });
-    
-    selector.outbounds.push(...warpRemarks, ...WoWRemarks);
-    return new Response(JSON.stringify(config, null, 4), { 
+
+    const selectorTags = [`💦 Warp - Best Ping 🚀`, `💦 WoW - Best Ping 🚀`, ...warpTags, ...wowTags];
+    const config = await buildSingBoxConfig(selectorTags, warpTags, wowTags, true, settings.warpEnableIPv6);
+    config.endpoints = [...endpoints.chains, ...endpoints.proxies];
+
+    return new Response(JSON.stringify(config, null, 4), {
         status: 200,
         headers: {
             'Content-Type': 'text/plain;charset=utf-8',
@@ -620,118 +584,99 @@ export async function getSingBoxWarpConfig (request, env, client) {
     });
 }
 
-export async function getSingBoxCustomConfig(request, env, isFragment) {
-    await initializeParams(request, env);
-    const { kvNotFound, proxySettings } = await getDataset(request, env);
-    if (kvNotFound) return await renderErrorPage(request, env, 'KV Dataset is not properly set!', null, true);
+export async function getSingBoxCustomConfig(env, isFragment) {
+    const settings = globalThis.settings;
     let chainProxy;
-    const { 
-        cleanIPs,  
-        ports, 
-        vlessConfigs, 
-        trojanConfigs, 
-        outProxy, 
-        outProxyParams,
-        customCdnAddrs,
-        customCdnHost,
-        customCdnSni,
-        bestVLESSTrojanInterval,
-        enableIPv6
-    } = proxySettings;
- 
-    if (outProxy) {
-        const proxyParams = JSON.parse(outProxyParams);      
+
+    if (settings.outProxy) {
         try {
-            chainProxy = buildSingBoxChainOutbound(proxyParams, enableIPv6);
+            chainProxy = buildSingBoxChainOutbound(settings.outProxyParams, settings.VLTRenableIPv6);
         } catch (error) {
             console.log('An error occured while parsing chain proxy: ', error);
             chainProxy = undefined;
-            await env.bpb.put("proxySettings", JSON.stringify({
-                ...proxySettings, 
+            const proxySettings = await env.kv.get("proxySettings", { type: 'json' });
+            await env.kv.put("proxySettings", JSON.stringify({
+                ...proxySettings,
                 outProxy: '',
                 outProxyParams: {}
             }));
         }
     }
-    
-    const Addresses = await getConfigAddresses(hostName, cleanIPs, enableIPv6);
-    const customCdnAddresses = customCdnAddrs ? customCdnAddrs.split(',') : [];
-    const totalAddresses = [...Addresses, ...customCdnAddresses];
-    const config = structuredClone(singboxConfigTemp);
-    const dnsObject = buildSingBoxDNS(proxySettings, totalAddresses, false, chainProxy ? 'proxy-1' : '✅ Selector');
-    const {rules, rule_set} = buildSingBoxRoutingRules(proxySettings);
-    config.dns.servers = dnsObject.servers;
-    config.dns.rules = dnsObject.rules;
-    if (dnsObject.fakeip) config.dns.fakeip = dnsObject.fakeip;
-    config.route.rules = rules;
-    config.route.rule_set = rule_set;
-    const selector = config.outbounds[0];
-    const urlTest = config.outbounds[1];
-    selector.outbounds = ['💦 Best Ping 💥'];
-    urlTest.interval = `${bestVLESSTrojanInterval}s`;
-    urlTest.tag = '💦 Best Ping 💥';
-    const totalPorts = ports.filter(port => isFragment ? defaultHttpsPorts.includes(port) : true);
-    let proxyIndex = 1;
-    const protocols = [
-        ...(vlessConfigs ? ['VLESS'] : []),
-        ...(trojanConfigs ? ['Trojan'] : [])
-    ];
 
-    protocols.forEach ( protocol => {
+    let proxyIndex = 1;
+    const protocols = [];
+    if (settings.VLConfigs) protocols.push('VLESS');
+    if (settings.TRConfigs) protocols.push('Trojan');
+    const tags = [];
+    const Addresses = await getConfigAddresses(false);
+    const outbounds = {
+        proxies: [],
+        chains: []
+    }
+
+    const ports = isFragment 
+        ? settings.ports.filter(port => globalThis.defaultHttpsPorts.includes(port))
+        : settings.ports;
+
+    protocols.forEach(protocol => {
         let protocolIndex = 1;
-        totalPorts.forEach ( port => {
-            totalAddresses.forEach ( addr => {
-                let VLESSOutbound, TrojanOutbound;
-                const isCustomAddr = customCdnAddresses.includes(addr);
-                const configType = isCustomAddr ? 'C' : isFragment ? 'F' : '';
-                const sni = isCustomAddr ? customCdnSni : randomUpperCase(hostName);
-                const host = isCustomAddr ? customCdnHost : hostName;
-                const remark = generateRemark(protocolIndex, port, addr, cleanIPs, protocol, configType);
-         
-                if (protocol === 'VLESS') {
-                    VLESSOutbound = buildSingBoxVLESSOutbound (
-                        proxySettings,
-                        chainProxy ? `proxy-${proxyIndex}` : remark, 
-                        addr, 
-                        port, 
-                        host,
-                        sni,
-                        isCustomAddr, 
-                        isFragment
-                    );
-                    config.outbounds.push(VLESSOutbound);
-                }
-                
-                if (protocol === 'Trojan') {
-                    TrojanOutbound = buildSingBoxTrojanOutbound (
-                        proxySettings,
-                        chainProxy ? `proxy-${proxyIndex}` : remark, 
-                        addr, 
-                        port, 
+        ports.forEach(port => {
+            Addresses.forEach(addr => {
+                let VLOutbound, TROutbound;
+                const isCustomAddr = settings.customCdnAddrs.includes(addr);
+                const configType = isCustomAddr ? 'C' : '';
+                const sni = isCustomAddr ? settings.customCdnSni : randomUpperCase(globalThis.hostName);
+                const host = isCustomAddr ? settings.customCdnHost : globalThis.hostName;
+                const tag = generateRemark(protocolIndex, port, addr, settings.cleanIPs, protocol, configType);
+
+                if (protocol === "VLESS") {
+                    VLOutbound = buildSingBoxVLOutbound(
+                        chainProxy ? `proxy-${proxyIndex}` : tag,
+                        addr,
+                        port,
                         host,
                         sni,
                         isCustomAddr,
                         isFragment
                     );
-                    config.outbounds.push(TrojanOutbound);
+
+                    outbounds.proxies.push(VLOutbound);
                 }
-                
+
+                if (protocol === "Trojan") {
+                    TROutbound = buildSingBoxTROutbound(
+                        chainProxy ? `proxy-${proxyIndex}` : tag,
+                        addr,
+                        port,
+                        host,
+                        sni,
+                        isCustomAddr,
+                        isFragment
+                    );
+
+                    outbounds.proxies.push(TROutbound);
+                }
+
                 if (chainProxy) {
                     const chain = structuredClone(chainProxy);
-                    chain.tag = remark;
+                    chain.tag = tag;
                     chain.detour = `proxy-${proxyIndex}`;
-                    config.outbounds.push(chain);
+                    outbounds.chains.push(chain);
                 }
-                
-                selector.outbounds.push(remark);
-                urlTest.outbounds.push(remark);
+
+                tags.push(tag);
+
                 proxyIndex++;
                 protocolIndex++;
             });
         });
     });
 
-    return new Response(JSON.stringify(config, null, 4), { 
+    const selectorTags = ['💦 Best Ping 💥', ...tags];
+    const config = await buildSingBoxConfig(selectorTags, tags, null, false, settings.VLTRenableIPv6);
+    config.outbounds.push(...outbounds.chains, ...outbounds.proxies);
+
+    return new Response(JSON.stringify(config, null, 4), {
         status: 200,
         headers: {
             'Content-Type': 'text/plain;charset=utf-8',
@@ -746,42 +691,25 @@ const singboxConfigTemp = {
         level: "warn",
         timestamp: true
     },
-    dns: {
-        servers: [],
-        rules: [],
-        independent_cache: true
-    },
+    dns: {},
     inbounds: [
-        {
-            type: "direct",
-            tag: "dns-in",
-            listen: "0.0.0.0",
-            listen_port: 6450,
-            override_address: "1.1.1.1",
-            override_port: 53
-        },
         {
             type: "tun",
             tag: "tun-in",
             address: [
-                "172.18.0.1/28",
-                "fdfe:dcba:9876::1/126"
+                "172.18.0.1/30"
             ],
             mtu: 9000,
             auto_route: true,
             strict_route: true,
-            stack: "mixed",
             endpoint_independent_nat: true,
-            sniff: true,
-            sniff_override_destination: true
+            stack: "mixed"
         },
         {
             type: "mixed",
             tag: "mixed-in",
             listen: "0.0.0.0",
-            listen_port: 2080,
-            sniff: true,
-            sniff_override_destination: false
+            listen_port: 2080
         }
     ],
     outbounds: [
@@ -791,38 +719,22 @@ const singboxConfigTemp = {
             outbounds: []
         },
         {
-            type: "urltest",
-            tag: "",
-            outbounds: [],
-            url: "https://www.gstatic.com/generate_204",
-            interval: ""
-        },
-        {
             type: "direct",
+            // domain_resolver: {
+            //     server: "dns-direct",
+            //     strategy: "ipv4_only"
+            // },
             tag: "direct"
-        },
-        {
-            type: "block",
-            tag: "block"
-        },
-        {
-            type: "dns",
-            tag: "dns-out"
         }
     ],
-    route: {
-        rules: [],
-        rule_set: [],
-        auto_detect_interface: true,
-        override_android_vpn: true,
-        final: "✅ Selector"
-    },
+    route: {},
     ntp: {
         enabled: true,
-        server: "time.apple.com",
+        server: "time.cloudflare.com",
         server_port: 123,
-        detour: "direct",
+        domain_resolver: "dns-direct",
         interval: "30m",
+        write_to_system: false
     },
     experimental: {
         cache_file: {
@@ -838,3 +750,154 @@ const singboxConfigTemp = {
         }
     }
 };
+
+function getRoutingRules() {
+    const settings = globalThis.settings;
+    return [
+        {
+            rule: true,
+            type: 'reject',
+            geosite: "geosite-malware",
+            geoip: "geoip-malware",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-malware.srs",
+            geoipURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-malware.srs"
+        },
+        {
+            rule: true,
+            type: 'reject',
+            geosite: "geosite-phishing",
+            geoip: "geoip-phishing",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-phishing.srs",
+            geoipURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-phishing.srs"
+        },
+        {
+            rule: true,
+            type: 'reject',
+            geosite: "geosite-cryptominers",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-cryptominers.srs",
+        },
+        {
+            rule: settings.blockAds,
+            type: 'reject',
+            geosite: "geosite-category-ads-all",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-category-ads-all.srs",
+        },
+        {
+            rule: settings.blockPorn,
+            type: 'reject',
+            geosite: "geosite-nsfw",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-nsfw.srs",
+        },
+        {
+            rule: settings.bypassIran,
+            type: 'direct',
+            dns: "dns-direct",
+            geosite: "geosite-ir",
+            geoip: "geoip-ir",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-ir.srs",
+            geoipURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-ir.srs"
+        },
+        {
+            rule: settings.bypassChina,
+            type: 'direct',
+            dns: "dns-direct",
+            geosite: "geosite-cn",
+            geoip: "geoip-cn",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-cn.srs",
+            geoipURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-cn.srs"
+        },
+        {
+            rule: settings.bypassRussia,
+            type: 'direct',
+            dns: "dns-direct",
+            geosite: "geosite-category-ru",
+            geoip: "geoip-ru",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-category-ru.srs",
+            geoipURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-ru.srs"
+        },
+        {
+            rule: settings.bypassOpenAi,
+            type: 'direct',
+            dns: "dns-anti-sanction",
+            geosite: "geosite-openai",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-openai.srs"
+        },
+        {
+            rule: settings.bypassMicrosoft,
+            type: 'direct',
+            dns: "dns-anti-sanction",
+            geosite: "geosite-microsoft",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-microsoft.srs"
+        },
+        {
+            rule: settings.bypassOracle,
+            type: 'direct',
+            dns: "dns-anti-sanction",
+            geosite: "geosite-oracle",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-oracle.srs"
+        },
+        {
+            rule: settings.bypassDocker,
+            type: 'direct',
+            dns: "dns-anti-sanction",
+            geosite: "geosite-docker",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-docker.srs"
+        },
+        {
+            rule: settings.bypassAdobe,
+            type: 'direct',
+            dns: "dns-anti-sanction",
+            geosite: "geosite-adobe",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-adobe.srs"
+        },
+        {
+            rule: settings.bypassEpicGames,
+            type: 'direct',
+            dns: "dns-anti-sanction",
+            geosite: "geosite-epicgames",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-epicgames.srs"
+        },
+        {
+            rule: settings.bypassIntel,
+            type: 'direct',
+            dns: "dns-anti-sanction",
+            geosite: "geosite-intel",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-intel.srs"
+        },
+        {
+            rule: settings.bypassAmd,
+            type: 'direct',
+            dns: "dns-anti-sanction",
+            geosite: "geosite-amd",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-amd.srs"
+        },
+        {
+            rule: settings.bypassNvidia,
+            type: 'direct',
+            dns: "dns-anti-sanction",
+            geosite: "geosite-nvidia",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-nvidia.srs"
+        },
+        {
+            rule: settings.bypassAsus,
+            type: 'direct',
+            dns: "dns-anti-sanction",
+            geosite: "geosite-asus",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-asus.srs"
+        },
+        {
+            rule: settings.bypassHp,
+            type: 'direct',
+            dns: "dns-anti-sanction",
+            geosite: "geosite-hp",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-hp.srs"
+        },
+        {
+            rule: settings.bypassLenovo,
+            type: 'direct',
+            dns: "dns-anti-sanction",
+            geosite: "geosite-lenovo",
+            geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-lenovo.srs"
+        },
+    ];
+}
